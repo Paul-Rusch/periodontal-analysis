@@ -74,9 +74,17 @@ recipes.  In short:
 [`analysis/__init__.py`](analysis/__init__.py) `__all__`.  See
 README.md "Public API" for the catalog.
 
-## Outputs you should regenerate after any change
+## Outputs you should regenerate / checks you should rerun after any change
 
 ```bash
-python tools/validate_periodontal_readings.py | head -3
-python scripts/render_recommendation.py
+python tools/validate_periodontal_readings.py | head -3   # OCR invariant: 840/840
+python -m pytest tests/ -v                                # semantic-correctness suite
+python scripts/render_recommendation.py                   # regenerate the report
 ```
+
+The test suite (39 tests, ~100 ms) lives under `tests/` and pins the
+silent-wrongness invariants from the original handoff prompt:
+chronology, full-key delta joins, interdental-only CAL staging,
+MGJ/GM normalization, provisional propagation on `Stage` and
+`Grade`, and citation output.  Tests requiring the personal-data
+CSV are skipped automatically on a fresh clone of the public repo.

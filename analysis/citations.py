@@ -57,8 +57,9 @@ TOOTH_CROWN_CAVEAT = (
     "of every reading); patient_history_events.csv restoration row"
 )
 SITE_MOUTH_BREATHING_CAVEAT = (
-    "patient_history_events.csv condition 'chronic_mouth_breathing' "
-    "(anterior-facial inflammation bias)"
+    "PERIODONTAL_INTERPRETATION.md sec 14 rule 1 (record provenance "
+    "of every reading); patient_history_events.csv condition "
+    "'chronic_mouth_breathing' (anterior-facial inflammation bias)"
 )
 
 # Patient / longitudinal (sec 15).

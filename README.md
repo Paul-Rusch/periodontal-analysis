@@ -79,6 +79,10 @@ python scripts/demo_patient_01.py
 
 # always-pass invariant
 python tools/validate_periodontal_readings.py | head -3
+
+# semantic-correctness test suite (39 tests; requires pytest from requirements-dev.txt)
+pip install -r requirements-dev.txt
+python -m pytest tests/ -v
 ```
 
 ## Repository layout
@@ -122,6 +126,15 @@ analysis/                           typed analytical layer + classification + lo
 scripts/
   demo_patient_01.py                console-style end-to-end demo
   render_recommendation.py          writes outputs/recommendation_patient_01.{md,json}
+tests/                              semantic-correctness test suite (pytest)
+  conftest.py                       shared session-scoped patient_01 fixture
+  _helpers.py                       synthetic Site / Mouth / Exam builders
+  test_chronology.py                ExamKey vs chart_id sort guard
+  test_full_key_joins.py            SiteKey equality + per_site_deltas no-collision guard
+  test_interdental_staging.py       Stage uses max_interdental_CAL (not max(CAL))
+  test_normalization.py             MGJ 0 -> None; GM 0 -> at-CEJ; mucogingival NOT_ASSESSABLE on patient_01
+  test_provisional_propagation.py   Stage III + Grade always provisional with mandatory caveats
+  test_citations.py                 every Evidence has rule_id + cites PERIODONTAL_INTERPRETATION.md
 outputs/
   periodontal_readings.csv          THE OCR deliverable (3,360 rows; LOCKED schema)
   periodontal_readings_ascii.txt    chronological ASCII reproduction (oracle for sanity checks)
@@ -133,7 +146,35 @@ outputs/
 PERIODONTAL_INTERPRETATION.md       clinical spec.  Every threshold the analytical layer enforces is cited here.
 .env                                OPENAI_API_KEY (gitignored; only needed to re-OCR, not to render)
 requirements.txt                    openai, python-dotenv, Pillow, pydantic
+requirements-dev.txt                pytest (for `python -m pytest tests/`)
 ```
+
+## Test suite
+
+The semantic-correctness suite under [`tests/`](tests/) covers the
+silent-wrongness modes the original handoff prompt called out:
+
+| test file | guards against |
+| --- | --- |
+| `test_chronology.py` | sorting exams by `chart_id` (anti-chronological) instead of `ExamKey` |
+| `test_full_key_joins.py` | per-site delta joins collapsing distinct sites because the join key was partial |
+| `test_interdental_staging.py` | Stage being computed from `max(CAL)` over all sites instead of `max_interdental_CAL` (distal/mesial only) |
+| `test_normalization.py` | `MGJ = 0` accidentally being treated as a real value (the silent-mucogingival-breach footgun); `GM = 0` losing the at-CEJ semantics |
+| `test_provisional_propagation.py` | `Stage` III or `Grade` accidentally returning `SUPPORTED` instead of `PROVISIONAL`, or losing the projection-window assumption |
+| `test_citations.py` | a future `Evidence` being added without a `rule_id` or without a citation back into `PERIODONTAL_INTERPRETATION.md` |
+
+Run with:
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests/ -v
+```
+
+The suite is deliberately fast (~100 ms total) because it's intended
+as a pre-commit gate.  Tests that depend on the real readings CSV
+(see `conftest.py::patient_01`) are skipped automatically if the
+data file is gitignored away (e.g. on a fresh clone of the public
+repo without local data restoration).
 
 ## OCR-pipeline final output (locked)
 
