@@ -1,0 +1,11 @@
+chart_id,arch,source_file,rotation_deg_clockwise,crop_x,crop_y,crop_width,crop_height,output_file
+1,maxillary,pdf_scans/Periodontal charting 1 of 5.jpg,90,430,1700,5710,560,crops/periodontal_charting_01_maxillary.jpg
+1,mandibular,pdf_scans/Periodontal charting 1 of 5.jpg,90,430,3320,5710,550,crops/periodontal_charting_01_mandibular.jpg
+2,maxillary,pdf_scans/Periodontal charting 2 of 5.jpg,90,430,1700,5710,560,crops/periodontal_charting_02_maxillary.jpg
+2,mandibular,pdf_scans/Periodontal charting 2 of 5.jpg,90,430,3340,5710,530,crops/periodontal_charting_02_mandibular.jpg
+3,maxillary,pdf_scans/Periodontal charting 3 of 5.jpg,90,430,1700,5710,560,crops/periodontal_charting_03_maxillary.jpg
+3,mandibular,pdf_scans/Periodontal charting 3 of 5.jpg,90,430,3340,5710,530,crops/periodontal_charting_03_mandibular.jpg
+4,maxillary,pdf_scans/Periodontal charting 4 of 5.jpg,90,430,1700,5710,560,crops/periodontal_charting_04_maxillary.jpg
+4,mandibular,pdf_scans/Periodontal charting 4 of 5.jpg,90,430,3320,5710,550,crops/periodontal_charting_04_mandibular.jpg
+5,maxillary,pdf_scans/Periodontal charting 5 of 5.jpg,90,430,1700,5710,560,crops/periodontal_charting_05_maxillary.jpg
+5,mandibular,pdf_scans/Periodontal charting 5 of 5.jpg,90,430,3340,5710,530,crops/periodontal_charting_05_mandibular.jpg
