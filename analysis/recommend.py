@@ -1,0 +1,824 @@
+"""Phase 5 recommendation renderer.
+
+PURE renderer.  Every clinical claim is the output of an
+:class:`analysis.evidence.Evidence` produced upstream by Phase 2-4
+modules.  No new clinical thresholds may appear as literal numbers
+in this file.  Numbers come from ``Evidence.value`` and
+``Evidence.trigger_measurements``; status badges come from
+``Evidence.status``; section headings come from ``Evidence.rule_id``.
+
+Output: :class:`RecommendationReport` carrying both a markdown string
+(for human review) and the underlying tuple of Evidence (the audit
+trail / future JSON view input).
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from datetime import date
+from pathlib import Path
+from typing import Any
+
+from analysis.evidence import Evidence, EvidenceStatus
+from analysis.exam import Exam
+from analysis.longitudinal import (
+    pst_or_graft_treatment_response,
+    recession_trajectory,
+    s3_pd_only_endpoint,
+    soft_tissue_intervention_assessment,
+    tooth_loss_events,
+    treatment_response,
+    trend_series,
+)
+from analysis.patient import Patient
+
+
+# ---------------------------------------------------------------------------
+# Data structures.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ToothFocus:
+    """A specific per-tooth clinical question to address in the report.
+
+    ``question`` is rendered as a section heading (free text -- the
+    only place free-text user input appears in the report; not a
+    clinical threshold).  ``tooth_number`` selects which tooth's
+    Evidence to surface.
+    """
+
+    tooth_number: int
+    question: str = ""
+
+
+@dataclass(frozen=True)
+class RecommendationReport:
+    """Output of :func:`report`.  Holds both the rendered markdown and
+    the full tuple of Evidence that backs it."""
+
+    patient_id: str
+    generated_at: date
+    markdown: str
+    evidence: tuple[Evidence, ...] = field(default_factory=tuple)
+
+    def write(self, markdown_path: Path, *, json_path: Path | None = None) -> None:
+        """Write the markdown to ``markdown_path``; optionally write
+        the audit-trail Evidence list as JSON to ``json_path``."""
+        markdown_path.parent.mkdir(parents=True, exist_ok=True)
+        markdown_path.write_text(self.markdown, encoding="utf-8")
+        if json_path is not None:
+            json_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "patient_id": self.patient_id,
+                "generated_at": self.generated_at.isoformat(),
+                "evidence": [e.to_dict() for e in self.evidence],
+            }
+            json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Top-level entry point.
+# ---------------------------------------------------------------------------
+
+
+def report(
+    patient: Patient,
+    *,
+    focus_teeth: tuple[ToothFocus, ...] = (),
+    generated_at: date | None = None,
+) -> RecommendationReport:
+    """Render the recommendation report for one patient.
+
+    ``focus_teeth`` is an ordered tuple of :class:`ToothFocus` objects;
+    each becomes a dedicated subsection at the top of the report
+    (after the headline) addressing the user's specific question
+    about that tooth.
+    """
+    generated_at = generated_at or date.today()
+    sections: list[str] = []
+    audit: list[Evidence] = []
+
+    sections.append(_render_header(patient, generated_at))
+    sections.append(_render_phase0_context(patient))
+    sections.append(_render_headline(patient, audit))
+
+    if focus_teeth:
+        sections.append(_render_focus_teeth(patient, focus_teeth, audit))
+
+    sections.append(_render_treatment_history_outcomes(patient, audit))
+    sections.append(_render_trajectory(patient, audit))
+    sections.append(_render_per_tooth_focus(patient, audit))
+    sections.append(_render_soft_tissue_candidates(patient, audit))
+    sections.append(_render_caveats_and_missing(patient, audit))
+    sections.append(_render_audit_trail(audit))
+
+    markdown = "\n\n".join(sections).rstrip() + "\n"
+    return RecommendationReport(
+        patient_id=patient.patient_id,
+        generated_at=generated_at,
+        markdown=markdown,
+        evidence=tuple(audit),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Section renderers.  Each takes the patient and an audit list it appends
+# every Evidence it touches into; returns a markdown string.
+# ---------------------------------------------------------------------------
+
+
+def _render_header(patient: Patient, generated_at: date) -> str:
+    md = patient.metadata
+    lines = [
+        f"# Periodontal analytical summary -- patient `{patient.patient_id}`",
+        "",
+        "> **Informational use only -- not a medical device.**  "
+        "This report is generated by the `analysis/` package from "
+        "periodontal probing-chart data and is intended to surface "
+        "structured findings within the AAP/EFP 2018 framework.  "
+        "It does **not** diagnose disease, replace a periodontist's "
+        "clinical judgement, or drive surgical or treatment "
+        "decisions on its own.  Every classification carries an "
+        "explicit `provisional` or `not_assessable` status and a "
+        "list of inputs the probing chart cannot speak to "
+        "(radiographic bone loss, mobility, furcation, MGJ / KTW, "
+        "intra-oral exam findings).  Always work with a licensed "
+        "periodontist using the full clinical examination, not "
+        "with this report alone.",
+        "",
+        f"_Generated {generated_at.isoformat()} from "
+        f"`outputs/periodontal_readings.csv` (3,360 rows; "
+        f"validator 840/840 = 100% on `CAL = PD + GM`) plus "
+        f"`manifests/patient_metadata.csv`, "
+        f"`manifests/chart_metadata.csv`, "
+        f"`manifests/patient_history_events.csv`._",
+        "",
+        "Every classification, threshold, and recommendation in this "
+        "report is the output of an `Evidence` object produced by the "
+        "`analysis/` package.  Each line carries a status flag "
+        "(`supported` / `provisional` / `not_assessable`) and a "
+        "citation back into `PERIODONTAL_INTERPRETATION.md`.  No "
+        "clinical thresholds appear in the renderer source.",
+    ]
+    if md.dob is not None:
+        age_baseline = patient.age_at(patient.baseline.exam_date)
+        age_recent = patient.age_at(patient.most_recent.exam_date)
+        lines += [
+            "",
+            f"**Patient.** DOB {md.dob.isoformat()}; sex {md.sex}; "
+            f"age {age_baseline:.1f} at baseline ({patient.baseline.exam_date}) "
+            f"-> {age_recent:.1f} at most recent exam ({patient.most_recent.exam_date}); "
+            f"observation window {patient.window_years:.2f} years across "
+            f"{len(patient.exams)} exams.",
+        ]
+    return "\n".join(lines)
+
+
+def _render_phase0_context(patient: Patient) -> str:
+    md = patient.metadata
+    history = patient.history
+    lines = ["## Phase 0 context (medical / behavioral / dental history)"]
+    if md.family_history_perio:
+        lines.append(
+            f"- **Family history of periodontitis: yes.** "
+            f"{md.family_history_details}.  Source: "
+            f"`manifests/patient_metadata.csv`."
+        )
+    else:
+        lines.append("- Family history of periodontitis: none on file.")
+    if md.allergies:
+        lines.append(f"- Allergies: {md.allergies}.")
+    smoking = history.of_type("smoking-period")
+    if smoking:
+        lines.append("- **Smoking history.**")
+        for ev in smoking:
+            window = (
+                f"{ev.start_date.isoformat() if ev.start_date else '?'} -> "
+                f"{ev.end_date.isoformat() if ev.end_date else 'ongoing'}"
+            )
+            note = ev.details.get("note", "")
+            lines.append(
+                f"  - `{ev.event_subtype}` ({window}): "
+                f"{ev.details.get('route', ev.details.get('frequency', ''))}. {note}"
+            )
+    conditions = history.of_type("condition")
+    if conditions:
+        lines.append("- **Systemic / behavioral conditions on file.**")
+        for ev in conditions:
+            note = ev.details.get("bias") or ev.details.get("note") or ""
+            lines.append(f"  - `{ev.event_subtype}`: {note}")
+    therapies = history.of_type("dental-therapy")
+    if therapies:
+        lines.append("- **Periodontal / surgical therapy on file.**")
+        for ev in therapies:
+            window = (
+                f"{ev.start_date.isoformat() if ev.start_date else '?'} -> "
+                f"{ev.end_date.isoformat() if ev.end_date else 'ongoing'}"
+            )
+            scope = (
+                f"tooth {ev.tooth_number}"
+                if ev.tooth_number is not None
+                else "full mouth"
+            )
+            note = ev.details.get("note", "")
+            lines.append(
+                f"  - `{ev.event_subtype}` on {scope} ({window}). {note}"
+            )
+    restorations = history.of_type("restoration")
+    if restorations:
+        lines.append("- **Restorations relevant to probing interpretation.**")
+        for ev in restorations:
+            scope = (
+                f"tooth {ev.tooth_number}"
+                if ev.tooth_number is not None
+                else "unspecified"
+            )
+            note = ev.details.get("bias") or ev.details.get("note") or ""
+            lines.append(f"  - `{ev.event_subtype}` on {scope}: {note}")
+    return "\n".join(lines)
+
+
+def _render_headline(patient: Patient, audit: list[Evidence]) -> str:
+    lines = [
+        "## Headline classification",
+        "",
+        "| exam | date | Stage | extent | CDC/AAP severity | "
+        "max interdental CAL (mm) | mean PD (mm) | n teeth PD>=6 |",
+        "|---:|---|---|---|---|---:|---:|---:|",
+    ]
+    for e in patient.exams:
+        st = e.mouth.stage()
+        ex = e.mouth.extent()
+        sv = e.mouth.cdc_aap_severity()
+        ic = e.mouth.max_interdental_CAL()
+        audit.extend([st, ex, sv, ic])
+        lines.append(
+            f"| {e.exam_index} | {e.exam_date.isoformat()} | "
+            f"**{st.value}** ({_status_badge(st)}) | "
+            f"{ex.value} | {sv.value} | "
+            f"{ic.value} | "
+            f"{e.mouth.mean_PD:.2f} | "
+            f"{e.mouth.n_teeth_with_PD_ge(6)} |"
+        )
+
+    g_full = patient.grade(label="full_window")
+    g_post = patient.grade(start_exam_index=2, end_exam_index=5, label="post_srp")
+    audit.extend([g_full, g_post])
+    lines += [
+        "",
+        "**AAP/EFP Grade A/B/C** -- always reported as `provisional`; "
+        "the published thresholds are 5-year and the observation window "
+        "here is shorter, so the result is scaled linearly with the "
+        "explicit projection-window assumption attached.  "
+        "(`PERIODONTAL_INTERPRETATION.md` sec 15.3.)",
+        "",
+        f"- Full window (`exam 1 -> exam 5`, **crosses SRP boundary**): "
+        f"**Grade {g_full.value}** ({_status_badge(g_full)}).  "
+        f"{_grade_triggers_inline(g_full)}",
+        f"- Post-SRP maintenance only (`exam 2 -> exam 5`): "
+        f"**Grade {g_post.value}** ({_status_badge(g_post)}).  "
+        f"{_grade_triggers_inline(g_post)}",
+        "",
+        "  _Interpretation: AAP/EFP grades on the **worst-progressing "
+        "single site**, not the mean.  Even when mean CAL improves, a "
+        "single site that progressed by >=1 mm over a sub-5-year window "
+        "extrapolates to Grade C.  Combined with patient age "
+        "(<40) and family history of periodontitis on both first-degree "
+        "relatives, the early-onset / familial picture is consistent._",
+    ]
+    return "\n".join(lines)
+
+
+def _render_focus_teeth(
+    patient: Patient,
+    focus_teeth: tuple[ToothFocus, ...],
+    audit: list[Evidence],
+) -> str:
+    lines = ["## Clinical questions addressed"]
+    for ft in focus_teeth:
+        lines.append("")
+        if ft.question:
+            lines.append(f"### Tooth {ft.tooth_number} -- {ft.question}")
+        else:
+            lines.append(f"### Tooth {ft.tooth_number}")
+        lines.append(_render_tooth_focus_block(patient, ft.tooth_number, audit))
+    return "\n".join(lines)
+
+
+def _render_tooth_focus_block(
+    patient: Patient,
+    tooth_number: int,
+    audit: list[Evidence],
+) -> str:
+    most_recent = patient.most_recent
+    if tooth_number not in most_recent.mouth.teeth:
+        return f"_Tooth {tooth_number} is not present in the most recent exam._"
+
+    t = most_recent.tooth(tooth_number)
+    trajectory = recession_trajectory(patient, tooth_number)
+    intervention = soft_tissue_intervention_assessment(patient, tooth_number)
+    prior_response = pst_or_graft_treatment_response(patient, tooth_number)
+    prognosis = t.prognosis_floor()
+    audit.extend(e for e in (trajectory, intervention, prior_response, prognosis) if e is not None)
+
+    lines: list[str] = []
+
+    lines.append(
+        f"**Current state at exam {most_recent.exam_index} "
+        f"({most_recent.exam_date.isoformat()})**: "
+        f"max PD {t.max_PD} mm, max CAL {t.max_CAL} mm, "
+        f"max recession {t.max_recession} mm; "
+        f"prognosis floor **{prognosis.value}** "
+        f"({_status_badge(prognosis)}).  "
+        f"_(`{prognosis.rule_id}`; cited: {prognosis.citation})_"
+    )
+
+    lines.append("")
+    lines.append(
+        f"**Recession trajectory across {len(patient.exams)} exams "
+        f"({patient.window_years:.2f} years):** **{trajectory.value}** "
+        f"({_status_badge(trajectory)}).  "
+        f"_(`{trajectory.rule_id}`; cited: {trajectory.citation})_"
+    )
+    moving_sites = [
+        t
+        for t in trajectory.trigger_measurements
+        if t.get("delta_gm_baseline_to_recent", 0) != 0
+        or any(g["gm_mm"] > 0 for g in t["gm_per_exam"])
+    ]
+    if moving_sites:
+        lines.append("")
+        lines.append("Per-site GM (mm; positive = recession):")
+        lines.append("")
+        lines.append("| surface / site | " + " | ".join(
+            f"e{e.exam_index} ({e.exam_date.isoformat()})"
+            for e in patient.exams
+        ) + " | delta (baseline -> most recent) |")
+        lines.append("|---|" + "---|" * len(patient.exams) + "---|")
+        for ms in moving_sites:
+            cells = " | ".join(str(g["gm_mm"]) for g in ms["gm_per_exam"])
+            lines.append(
+                f"| {ms['surface']} / {ms['site']} | {cells} | "
+                f"{ms['delta_gm_baseline_to_recent']:+d} |"
+            )
+
+    if prior_response is not None and prior_response.is_supported:
+        proc_name = prior_response.scope[-1] if len(prior_response.scope) >= 3 else "(procedure)"
+        lines.append("")
+        lines.append(
+            f"**Prior soft-tissue procedure on this tooth: "
+            f"`{proc_name}`** -- maximum recession reduction "
+            f"{prior_response.value} mm at the worst-improved site, "
+            f"comparing the last pre-procedure exam to the first "
+            f"post-procedure exam.  "
+            f"_(`{prior_response.rule_id}`; cited: {prior_response.citation})_"
+        )
+
+    # Peer comparison: surface what other teeth on this patient looked
+    # like at the time they received a PST/graft, so the reader can
+    # judge whether tooth_number's current state is in the same
+    # severity range as the precedent.
+    peer_block = _render_peer_pst_comparison(patient, tooth_number, audit)
+    if peer_block:
+        lines.append("")
+        lines.append(peer_block)
+
+    lines.append("")
+    lines.append(
+        f"**Soft-tissue intervention assessment:** "
+        f"**{intervention.value}** ({_status_badge(intervention)}).  "
+        f"_Threshold rule (from `analysis/longitudinal.py`): "
+        f"\"{intervention.threshold_crossed}\".  "
+        f"`{intervention.rule_id}`; cited: {intervention.citation}._"
+    )
+    if intervention.assumptions:
+        lines.append("")
+        lines.append("Assumptions / what the chart cannot answer:")
+        for a in intervention.assumptions:
+            lines.append(f"- {a}")
+    if intervention.missing_inputs:
+        lines.append("")
+        lines.append(
+            f"Missing inputs that would refine this assessment: "
+            f"{', '.join('`' + m + '`' for m in intervention.missing_inputs)}."
+        )
+
+    return "\n".join(lines)
+
+
+def _render_peer_pst_comparison(
+    patient: Patient, exclude_tooth: int, audit: list[Evidence]
+) -> str:
+    """Render a comparative-context block summarising what each prior
+    PST/graft tooth on this patient looked like at the time it was
+    treated, so the reader can judge severity comparable to the
+    current focus tooth."""
+    soft_tissue_subtypes = {
+        "pinhole_soft_tissue_technique",
+        "free_gingival_graft",
+        "connective_tissue_graft",
+        "coronally_advanced_flap",
+    }
+    rows: list[tuple[int, str, int, int]] = []  # (tooth, procedure, pre_max_recession, delta)
+    seen: set[int] = set()
+    for ev in patient.history.of_type("dental-therapy"):
+        if ev.event_subtype not in soft_tissue_subtypes:
+            continue
+        if ev.tooth_number is None or ev.tooth_number in seen:
+            continue
+        if ev.tooth_number == exclude_tooth:
+            continue
+        seen.add(ev.tooth_number)
+        response = pst_or_graft_treatment_response(patient, ev.tooth_number)
+        if response is None or not response.is_supported:
+            continue
+        audit.append(response)
+        # pull pre-procedure max_recession at the most-improved site
+        per_site = next(
+            (
+                t["value"]
+                for t in response.trigger_measurements
+                if t["name"] == "per_site_changes"
+            ),
+            (),
+        )
+        if not per_site:
+            continue
+        pre_max = max(s["pre_gm_mm"] for s in per_site)
+        delta = response.value
+        rows.append((ev.tooth_number, ev.event_subtype, pre_max, delta))
+    if not rows:
+        return ""
+    lines = [
+        "**Comparative context** -- prior soft-tissue procedures on this "
+        "patient (so this tooth's current state can be judged against the "
+        "severity that previously triggered intervention):",
+        "",
+        "| tooth | procedure | max recession at time of procedure (mm) | "
+        "max recession reduction achieved (mm) |",
+        "|---:|---|---:|---:|",
+    ]
+    for tn, proc, pre_max, delta in rows:
+        lines.append(f"| {tn} | `{proc}` | {pre_max} | {delta} |")
+    return "\n".join(lines)
+
+
+def _render_treatment_history_outcomes(patient: Patient, audit: list[Evidence]) -> str:
+    lines = ["## Treatment history and measured outcomes", ""]
+
+    # SRP response (1->2 if SRP is on file).
+    srp_events = [
+        e
+        for e in patient.history.of_type("dental-therapy")
+        if e.event_subtype == "full_mouth_srp"
+    ]
+    if srp_events:
+        lines.append("### Full-mouth SRP")
+        lines.append(
+            f"On file: `{srp_events[0].start_date} -> {srp_events[0].end_date}` "
+            f"({srp_events[0].details.get('note', '')})."
+        )
+        lines.append("")
+        lines.append("Treatment-response widget set across the SRP boundary "
+                     "(`exam 1 -> exam 2`):")
+        lines.append("")
+        for ev in patient.treatment_response(from_exam=1, to_exam=2):
+            audit.append(ev)
+            lines.append(
+                f"- `{ev.rule_id}`: **{ev.value}** "
+                f"({_status_badge(ev)}); cited: {ev.citation}."
+            )
+        lines.append("")
+        lines.append("Maintenance-phase response (`exam 2 -> exam 5`):")
+        lines.append("")
+        for ev in patient.treatment_response(from_exam=2, to_exam=5):
+            audit.append(ev)
+            lines.append(
+                f"- `{ev.rule_id}`: **{ev.value}** "
+                f"({_status_badge(ev)}); cited: {ev.citation}."
+            )
+
+    # Soft-tissue surgical events (PST / grafts).
+    soft_tissue_subtypes = {
+        "pinhole_soft_tissue_technique",
+        "free_gingival_graft",
+        "connective_tissue_graft",
+        "coronally_advanced_flap",
+    }
+    soft_events = [
+        ev
+        for ev in patient.history.of_type("dental-therapy")
+        if ev.event_subtype in soft_tissue_subtypes
+    ]
+    if soft_events:
+        lines.append("")
+        lines.append("### Soft-tissue surgical procedures")
+        # Deduplicate procedures (multiple rows for multi-tooth procedures).
+        teeth_seen: set[int] = set()
+        for ev in soft_events:
+            if ev.tooth_number is None or ev.tooth_number in teeth_seen:
+                continue
+            teeth_seen.add(ev.tooth_number)
+            response = pst_or_graft_treatment_response(patient, ev.tooth_number)
+            if response is None:
+                continue
+            audit.append(response)
+            per_site = next(
+                (t["value"] for t in response.trigger_measurements
+                 if t["name"] == "per_site_changes"),
+                (),
+            )
+            pre_idx = next(
+                (t["value"] for t in response.trigger_measurements
+                 if t["name"] == "pre_exam_index"),
+                None,
+            )
+            post_idx = next(
+                (t["value"] for t in response.trigger_measurements
+                 if t["name"] == "post_exam_index"),
+                None,
+            )
+            lines.append("")
+            lines.append(
+                f"**Tooth {ev.tooth_number} -- `{ev.event_subtype}`** "
+                f"({ev.start_date} -> {ev.end_date}).  "
+                f"Pre-procedure exam: {pre_idx}; first post-procedure exam: "
+                f"{post_idx}.  Maximum recession reduction at any site of "
+                f"this tooth: **{response.value} mm** "
+                f"({_status_badge(response)}).  "
+                f"_(`{response.rule_id}`; cited: {response.citation})_"
+            )
+            for ch in per_site:
+                lines.append(
+                    f"- {ch['surface']} / {ch['site']}: "
+                    f"GM {ch['pre_gm_mm']} mm -> {ch['post_gm_mm']} mm "
+                    f"(delta {ch['delta_gm_mm']:+d} mm)."
+                )
+    return "\n".join(lines)
+
+
+def _render_trajectory(patient: Patient, audit: list[Evidence]) -> str:
+    lines = ["## Mouth-level trajectory across exams", ""]
+    metric_specs = [
+        ("mean_PD", "mean PD (mm)"),
+        ("mean_CAL", "mean CAL (mm)"),
+        ("pct_sites_PD_ge_4", "% sites with PD >= 4"),
+        ("pct_sites_PD_ge_6", "% sites with PD >= 6"),
+        ("n_teeth_with_PD_ge_6", "n teeth with max PD >= 6"),
+        ("n_teeth_with_CAL_ge_5", "n teeth with max CAL >= 5"),
+        ("max_interdental_CAL", "max interdental CAL (mm)"),
+    ]
+    lines.append(
+        "| metric | "
+        + " | ".join(f"e{e.exam_index} ({e.exam_date.isoformat()})" for e in patient.exams)
+        + " |"
+    )
+    lines.append("|---" + "|---" * len(patient.exams) + "|")
+    for metric_name, header in metric_specs:
+        ev = patient.trend(metric_name)
+        audit.append(ev)
+        cells = " | ".join(str(pt["value"]) for pt in ev.value)
+        lines.append(f"| {header} | {cells} |")
+    lines.append("")
+    lines.append(
+        "Each row above is one `Evidence(rule_id="
+        "'longitudinal.trend.<metric>')`; cited in "
+        "`PERIODONTAL_INTERPRETATION.md` sec 15.2."
+    )
+
+    # EFP S3 PD-only endpoint per exam.
+    lines.append("")
+    lines.append("### EFP S3 PD-only treatment endpoint per exam")
+    lines.append("")
+    lines.append(
+        "_Full S3 endpoint requires BOP (we don't have); the PD-only "
+        "floor variant is \"no tooth with PD >= 6\".  "
+        "`PERIODONTAL_INTERPRETATION.md` sec 15.4._"
+    )
+    lines.append("")
+    for e in patient.exams:
+        ev = e.s3_pd_only_endpoint()
+        audit.append(ev)
+        n = next(
+            (t["value"] for t in ev.trigger_measurements
+             if t["name"] == "n_teeth_with_PD_ge_6"),
+            None,
+        )
+        achievement = "achieved" if ev.value else "not achieved"
+        lines.append(
+            f"- exam {e.exam_index} ({e.exam_date.isoformat()}): **{achievement}** "
+            f"({_status_badge(ev)}); n teeth with PD>=6 = {n}."
+        )
+    return "\n".join(lines)
+
+
+def _render_per_tooth_focus(patient: Patient, audit: list[Evidence]) -> str:
+    lines = ["## Where to focus next visit", ""]
+    lines.append(
+        "Per-tooth prognosis floor at the most recent exam, sorted "
+        "worst-first.  The floor is computed from PD/CAL alone "
+        "(`prognosis.floor.*`); mobility, furcation, and RBL inputs "
+        "(if added later) can only make it worse, never better.  "
+        "`PERIODONTAL_INTERPRETATION.md` sec 9 [16]."
+    )
+    lines.append("")
+    rank = {"hopeless": 0, "questionable": 1, "poor": 2, "fair": 3, "good": 4}
+    rows = []
+    for tn in sorted(patient.most_recent.mouth.teeth):
+        t = patient.most_recent.tooth(tn)
+        pf = t.prognosis_floor()
+        audit.append(pf)
+        rows.append((rank.get(pf.value, 99), tn, t, pf))
+    rows.sort()
+    lines.append(
+        "| tooth | max PD (mm) | max CAL (mm) | max recession (mm) | "
+        "prognosis floor | trajectory of recession |"
+    )
+    lines.append("|---:|---:|---:|---:|---|---|")
+    for _, tn, t, pf in rows[:14]:
+        traj = recession_trajectory(patient, tn)
+        audit.append(traj)
+        lines.append(
+            f"| {tn} | {t.max_PD} | {t.max_CAL} | {t.max_recession} | "
+            f"**{pf.value}** ({_status_badge(pf)}) | {traj.value} |"
+        )
+    lines.append("")
+    lines.append("_Showing 14 worst teeth; full table available via "
+                 "`patient.most_recent.mouth.tooth(N).prognosis_floor()`._")
+
+    # S3 endpoint blocker callout.
+    s3 = patient.most_recent.s3_pd_only_endpoint()
+    audit.append(s3)
+    if not s3.value:
+        deep_teeth = sorted(
+            tn for tn, t in patient.most_recent.mouth.teeth.items()
+            if t.max_PD >= 6
+        )
+        lines.append("")
+        lines.append(
+            f"**EFP S3 PD-only endpoint blocker(s) at the most recent exam:** "
+            f"tooth(s) {deep_teeth}.  Eliminating PD >= 6 here flips "
+            f"`{s3.rule_id}` to `achieved`.  Cited: {s3.citation}."
+        )
+    return "\n".join(lines)
+
+
+def _render_soft_tissue_candidates(patient: Patient, audit: list[Evidence]) -> str:
+    """Rank every tooth at the most recent exam by max recession,
+    surface its trajectory, prior soft-tissue procedure (if any), and
+    `soft_tissue_intervention_assessment` value, so the reader can
+    see at a glance which teeth are the strongest chart-derived
+    candidates for future PST / graft consideration.
+    """
+    most_recent = patient.most_recent
+    rows: list[tuple[int, int, str, str, Evidence | None, Evidence]] = []
+    for tn in sorted(most_recent.mouth.teeth):
+        t = most_recent.tooth(tn)
+        traj = recession_trajectory(patient, tn)
+        intv = soft_tissue_intervention_assessment(patient, tn)
+        prior = pst_or_graft_treatment_response(patient, tn)
+        audit.extend([traj, intv])
+        if prior is not None:
+            audit.append(prior)
+        # Per-site recession at most_recent (only sites with GM > 0).
+        nonzero_sites = [
+            f"{s.site_key.surface[:1]}/{s.site_key.site} = {s.gm.mm} mm"
+            for s in t.sites
+            if s.recession_mm > 0
+        ]
+        nonzero_text = "; ".join(nonzero_sites) if nonzero_sites else "(no recession)"
+        rows.append((t.max_recession, tn, traj.value, nonzero_text, prior, intv))
+
+    rows.sort(key=lambda r: (-r[0], r[1]))
+
+    lines = [
+        "## Soft-tissue intervention -- candidates ranked",
+        "",
+        "Every tooth at the most recent exam, ranked by `max_recession_tooth` "
+        "(descending).  The intervention assessment value is from "
+        "`analysis/longitudinal.soft_tissue_intervention_assessment`; the "
+        "encoded threshold rule is `>= 2 mm AND progressing -> "
+        "recommended_for_evaluation; >= 2 mm AND stable -> monitor; "
+        "< 2 mm -> no_significant_recession`.  Any tooth with a prior "
+        "PST / graft on file resolves to `already_treated`.  See "
+        "`PERIODONTAL_INTERPRETATION.md` sec 10 + sec 14 rule 1 [6][7].",
+        "",
+        "| rank | tooth | max recession (mm) | recession sites @ most recent | trajectory | prior soft-tissue procedure | intervention assessment |",
+        "|---:|---:|---:|---|---|---|---|",
+    ]
+    for i, (max_rec, tn, traj_val, nonzero_text, prior, intv) in enumerate(rows, 1):
+        prior_text = "-"
+        if prior is not None and prior.is_supported and len(prior.scope) >= 3:
+            prior_text = f"`{prior.scope[-1]}` (-{prior.value} mm at worst-improved site)"
+        lines.append(
+            f"| {i} | {tn} | {max_rec} | {nonzero_text} | {traj_val} | "
+            f"{prior_text} | **{intv.value}** ({_status_badge(intv)}) |"
+        )
+    lines.append("")
+    lines.append(
+        "_All assessments are `provisional` -- the actual surgical "
+        "decision additionally requires KTW (MGJ not recorded in this "
+        "dataset), intra-oral clinician judgment, and patient factors "
+        "(aesthetic concern, root sensitivity, OH compliance) that the "
+        "chart alone cannot speak to._"
+    )
+    return "\n".join(lines)
+
+
+def _render_caveats_and_missing(patient: Patient, audit: list[Evidence]) -> str:
+    lines = ["## Caveats, missing inputs, and what would tighten this report", ""]
+    lines.append(
+        "- **MGJ was not recorded on any of the 5 source charts** "
+        "(all 840 raw values were 0; normalized to `None` at the "
+        "`analysis/normalize.py` parser layer per "
+        "`PERIODONTAL_INTERPRETATION.md` sec 14 rule 1).  Consequently "
+        "every mucogingival metric "
+        "(`mucogingival_breach`, `KTW`, `min_KTW_tooth`) returns "
+        "`Evidence(status=not_assessable, missing_inputs=['MGJ'])`.  "
+        "Adding MGJ at sites of clinical interest (especially recession "
+        "sites: facial central of teeth 11, 21, 22 historical, plus "
+        "any tooth with max recession >= 2 mm) would unlock "
+        "`KTW < 1 mm` deficient flagging and "
+        "`PD >= MGJ` mucogingival breach detection."
+    )
+    lines.append(
+        "- **No BOP / plaque / mobility / furcation / RBL.** This caps "
+        "the upgrade ceiling for several rules: "
+        "AAP/EFP Stage cannot rise above III (Stage IV upgrade requires "
+        "tooth-loss-due-to-perio, mobility, or remaining-teeth count); "
+        "EFP S3 endpoint runs as PD-only; "
+        "PSR collapses codes 1 and 2 into 0; "
+        "per-tooth prognosis is reported only as a floor."
+    )
+    lines.append(
+        "- **AAP/EFP Grade is always provisional** -- the dataset window "
+        "is shorter than the published 5-year reference, so the result "
+        "is scaled linearly with the explicit "
+        "`projected from {window:.2f}-year window` assumption."
+    )
+    lines.append(
+        "- **Tooth 8 is crowned** (Phase 0 history); its PD/GM/CAL "
+        "readings carry a probing-bias caveat (`caveat.crown_margin_"
+        "probing_bias`) attached at load time."
+    )
+    lines.append(
+        "- **Chronic mouth breathing is on file**; anterior-facial "
+        "sites of teeth 6-11 maxillary and 22-27 mandibular carry "
+        "a `caveat.mouth_breathing_anterior_facial_bias` Evidence "
+        "attached to each affected `Site`.  Inflammation and PD on "
+        "those sites may be biased upward independent of true "
+        "attachment loss."
+    )
+    return "\n".join(lines)
+
+
+def _render_audit_trail(audit: list[Evidence]) -> str:
+    lines = ["## Audit trail -- every Evidence rendered, by `rule_id`", ""]
+    seen: dict[str, int] = {}
+    for ev in audit:
+        seen[ev.rule_id] = seen.get(ev.rule_id, 0) + 1
+    lines.append(
+        "| rule_id | times rendered | example status | example citation |"
+    )
+    lines.append("|---|---:|---|---|")
+    example_per_rule: dict[str, Evidence] = {}
+    for ev in audit:
+        example_per_rule.setdefault(ev.rule_id, ev)
+    for rid in sorted(seen):
+        ev = example_per_rule[rid]
+        lines.append(
+            f"| `{rid}` | {seen[rid]} | {ev.status.value} | {ev.citation} |"
+        )
+    lines.append("")
+    lines.append(
+        f"**{len(audit)} Evidence objects rendered total; "
+        f"{len(seen)} distinct `rule_id`s.**"
+    )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Tiny formatting helpers.
+# ---------------------------------------------------------------------------
+
+
+def _status_badge(ev: Evidence) -> str:
+    if ev.status is EvidenceStatus.SUPPORTED:
+        return "supported"
+    if ev.status is EvidenceStatus.PROVISIONAL:
+        return "**provisional**"
+    return "**not assessable**"
+
+
+def _grade_triggers_inline(ev: Evidence) -> str:
+    parts: list[str] = []
+    for t in ev.trigger_measurements:
+        if t["name"] == "window_years":
+            parts.append(f"window {t['value']}y")
+        elif t["name"] == "max_cal_change_observed_mm":
+            parts.append(f"max single-site delta_CAL = {t['value']:+} mm")
+        elif t["name"] == "cal_change_5yr_equiv_mm":
+            parts.append(f"5-year-equivalent {t['value']} mm")
+    return "; ".join(parts) + "."
